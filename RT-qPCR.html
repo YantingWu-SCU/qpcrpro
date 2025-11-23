@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RT-qPCR Pro</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jstat@latest/dist/jstat.min.js"></script>
+
+    <style>
+        body { background-color: #f4f7f6; padding-bottom: 60px; font-family: -apple-system, system-ui, sans-serif; }
+        .container { max-width: 1400px; margin-top: 30px; }
+        .header-box { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 25px; border-top: 5px solid #0d6efd; }
+        .ct-input { width: 100%; height: 90px; font-size: 13px; font-family: 'Consolas', monospace; border: 1px solid #dee2e6; border-radius: 4px; background: #fafafa; }
+        
+        /* 矩阵表格样式优化 */
+        .matrix-table th { background-color: #e9ecef; text-align: center; vertical-align: middle; padding: 10px; }
+        .matrix-table td { text-align: center; vertical-align: middle; height: 50px; font-size: 1.1rem; /* 字体加大 */ }
+        
+        /* P值显示样式 */
+        .p-sig { color: #d63384; font-weight: 800; } /* 显著 - 深粉红 */
+        .p-ns { color: #adb5bd; font-size: 0.9rem; } /* 不显著 - 灰色 */
+        
+        .prism-area { font-family: 'Consolas', monospace; font-size: 12px; height: 180px; white-space: pre; overflow-x: auto; border: 1px solid #ced4da; }
+        .btn-demo { border: 1px dashed #6c757d; color: #6c757d; }
+        .btn-demo:hover { background: #f8f9fa; color: #0d6efd; border-color: #0d6efd; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="header-box">
+        <h2 class="mb-4 text-primary fw-bold">🧬 RT-qPCR 分析工具 (P值修复版)</h2>
+        <div class="row g-3">
+            <div class="col-md-3">
+                <label class="form-label fw-bold">实验组数量</label>
+                <input type="number" id="numGroups" class="form-control" value="3" min="2" onchange="updateUI()">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-bold">基因数量</label>
+                <input type="number" id="numGenes" class="form-control" value="2" min="1">
+            </div>
+            <div class="col-md-6 d-flex align-items-end">
+                <button class="btn btn-primary w-100 fw-bold shadow-sm" onclick="initTable()">
+                    <span id="btnLabel">1. 生成表格</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div id="inputSection" class="header-box" style="display:none;">
+        <div class="d-flex justify-content-between align-items-center mb-3 border-bottom pb-2">
+            <h5 class="text-secondary m-0">步骤 1: 录入原始 Ct 值</h5>
+            <button class="btn btn-sm btn-demo" onclick="fillDemoData()">🪄 点击这里填充演示数据 (Test)</button>
+        </div>
+        
+        <div class="table-responsive mb-4">
+            <table class="table table-bordered align-middle">
+                <thead><tr id="headerRow" class="table-light"></tr></thead>
+                <tbody id="bodyRows"></tbody>
+            </table>
+        </div>
+        
+        <div class="row g-3 bg-light p-3 rounded border">
+            <div class="col-md-4">
+                <label class="fw-bold text-danger">① 内参基因 (必须填):</label>
+                <select id="refGeneSelect" class="form-select"></select>
+            </div>
+            <div class="col-md-4">
+                <label class="fw-bold">② 对照组 (Calibrator):</label>
+                <select id="controlGroupSelect" class="form-select"></select>
+            </div>
+            <div class="col-md-4 d-flex align-items-end">
+                <button class="btn btn-success w-100 fw-bold py-2 shadow-sm" onclick="calculate()">
+                    2. 开始计算 (Calc)
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div id="resultSection"></div>
+</div>
+
+<script>
+    // --- 手写统计学算法 (解决 NaN 问题的核心) ---
+
+    // 1. 计算平均值
+    const getMean = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
+
+    // 2. 计算方差 (Sample Variance)
+    const getVariance = (arr, mean) => {
+        return arr.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (arr.length - 1);
+    };
+
+    // 3. 独立样本 T 检验 (Two-sample Unpaired T-test)
+    function manualTTest(group1, group2) {
+        let n1 = group1.length;
+        let n2 = group2.length;
+        if (n1 < 2 || n2 < 2) return NaN; // 数据不足
+
+        let m1 = getMean(group1);
+        let m2 = getMean(group2);
+        let v1 = getVariance(group1, m1);
+        let v2 = getVariance(group2, m2);
+
+        // 如果两组方差都是0
+        if (v1 === 0 && v2 === 0) {
+            return (m1 === m2) ? 1.0 : 0.0; // 完全一样P=1，不一样P=0
+        }
+
+        // 计算合并方差 (Pooled Variance)
+        let sp2 = ((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2);
+        
+        // 标准误 (Standard Error)
+        let se = Math.sqrt(sp2 * (1 / n1 + 1 / n2));
+        if (se === 0) return 0; // 避免除以0
+
+        // t 统计量
+        let t_stat = (m1 - m2) / se;
+        
+        // 自由度
+        let df = n1 + n2 - 2;
+
+        // 使用 jStat 查找 T 分布的 P 值 (双尾)
+        let p = jStat.studentt.cdf(-Math.abs(t_stat), df) * 2;
+        return p;
+    }
+
+    // --- UI 与 逻辑 ---
+
+    function updateUI() {
+        const n = parseInt(document.getElementById('numGroups').value);
+        document.getElementById('btnLabel').innerText = n === 2 ? "1. 生成表格 (Mode: T-test)" : "1. 生成表格 (Mode: ANOVA)";
+    }
+
+    function initTable() {
+        const nGrp = parseInt(document.getElementById('numGroups').value);
+        const nGene = parseInt(document.getElementById('numGenes').value);
+        const header = document.getElementById('headerRow');
+        const body = document.getElementById('bodyRows');
+        
+        header.innerHTML = '<th style="width:150px; background:#f1f3f5;">组名</th>';
+        body.innerHTML = '';
+
+        for(let j=0; j<nGene; j++) {
+            let def = j===0 ? "GAPDH" : (j===1 ? "Runx2" : `Gene${j}`);
+            header.innerHTML += `<th><input type="text" class="form-control form-control-sm fw-bold text-center border-0" value="${def}" id="geneName_${j}" oninput="updateDrops()" style="background:transparent;"></th>`;
+        }
+
+        for(let i=0; i<nGrp; i++) {
+            let def = i===0 ? "Control" : (i===1 ? "Hydrogel" : `Group${i}`);
+            let tr = document.createElement('tr');
+            tr.innerHTML = `<td><input type="text" class="form-control fw-bold" value="${def}" id="groupName_${i}" oninput="updateDrops()"></td>`;
+            for(let j=0; j<nGene; j++) {
+                tr.innerHTML += `<td><textarea class="ct-input" id="ct_${i}_${j}" placeholder="23.5&#10;23.6"></textarea></td>`;
+            }
+            body.appendChild(tr);
+        }
+
+        document.getElementById('inputSection').style.display = 'block';
+        updateDrops();
+        updateUI();
+    }
+
+    function updateDrops() {
+        const nGrp = parseInt(document.getElementById('numGroups').value);
+        const nGene = parseInt(document.getElementById('numGenes').value);
+        const refS = document.getElementById('refGeneSelect');
+        const ctrlS = document.getElementById('controlGroupSelect');
+        
+        refS.innerHTML = ''; ctrlS.innerHTML = '';
+        for(let j=0; j<nGene; j++) refS.add(new Option(document.getElementById(`geneName_${j}`).value, j));
+        for(let i=0; i<nGrp; i++) ctrlS.add(new Option(document.getElementById(`groupName_${i}`).value, i));
+    }
+
+    function fillDemoData() {
+        // 演示数据：确保格式是标准的数字+换行
+        // Control: High Ct (Low expr), Gel: Low Ct (High expr)
+        const demoRef = ["18.1\n18.2\n18.0", "18.2\n18.0\n18.1", "18.1\n18.3\n18.0"];
+        const demoTarget = ["30.5\n30.8\n30.2", "25.2\n25.5\n25.0", "22.1\n22.5\n21.8"]; 
+
+        const nGrp = parseInt(document.getElementById('numGroups').value);
+        if(nGrp < 3) {
+             document.getElementById('numGroups').value = 3;
+             initTable();
+        }
+        
+        for(let i=0; i<3; i++) {
+            // Ref (Column 0)
+            let cellRef = document.getElementById(`ct_${i}_0`);
+            if(cellRef) cellRef.value = demoRef[i];
+            
+            // Target (Column 1)
+            let cellTar = document.getElementById(`ct_${i}_1`);
+            if(cellTar) cellTar.value = demoTarget[i];
+        }
+        alert("演示数据已填入！\nRef: GAPDH (Col 1)\nTarget: Runx2 (Col 2)\n请点击绿色计算按钮。");
+    }
+
+    const parse = txt => {
+        if(!txt) return [];
+        return txt.replace(/，/g, ',').split(/[\n\s,]+/)
+                  .filter(v => v.trim()!=='' && !isNaN(v))
+                  .map(Number);
+    };
+
+    function fmtP(p) {
+        if(isNaN(p)) return "<span class='text-muted small'>Data Error</span>";
+        
+        // P值显示逻辑
+        let valStr = p < 0.0001 ? "< 0.0001" : p.toFixed(4);
+        let star = "";
+        let cls = "p-ns";
+
+        if(p < 0.001) { star = "***"; cls = "p-sig"; }
+        else if(p < 0.01) { star = "**"; cls = "p-sig"; }
+        else if(p < 0.05) { star = "*"; cls = "p-sig"; } // 红色加粗
+        else { star = "ns"; cls = "p-ns"; } // 灰色
+
+        return `<span class="${cls}">${valStr} (${star})</span>`;
+    }
+
+    function calculate() {
+        const nGrp = parseInt(document.getElementById('numGroups').value);
+        const nGene = parseInt(document.getElementById('numGenes').value);
+        const refIdx = parseInt(document.getElementById('refGeneSelect').value);
+        const ctrlIdx = parseInt(document.getElementById('controlGroupSelect').value);
+        const container = document.getElementById('resultSection');
+        
+        container.innerHTML = '';
+        let groupNames = [];
+        for(let i=0; i<nGrp; i++) groupNames.push(document.getElementById(`groupName_${i}`).value);
+        let geneNames = [];
+        for(let j=0; j<nGene; j++) geneNames.push(document.getElementById(`geneName_${j}`).value);
+
+        // 遍历基因
+        for(let g=0; g<nGene; g++) {
+            if(g === refIdx) continue;
+
+            let allDCt = []; 
+            let allRelExpr = []; 
+            let meanRelExpr = [];
+            let maxRep = 0;
+
+            // 1. 数据解析与 dCt 计算
+            for(let i=0; i<nGrp; i++) {
+                let tVals = parse(document.getElementById(`ct_${i}_${g}`).value);
+                let rVals = parse(document.getElementById(`ct_${i}_${refIdx}`).value);
+                
+                if(tVals.length < 2 || rVals.length < 2) {
+                    allDCt.push([]); allRelExpr.push([]); meanRelExpr.push(0); continue;
+                }
+                
+                let rMean = getMean(rVals);
+                let dCts = tVals.map(v => v - rMean);
+                allDCt.push(dCts);
+            }
+
+            // 2. 相对表达量计算
+            if(allDCt[ctrlIdx].length === 0) { alert("对照组数据缺失"); return; }
+            let ctrlMeanDCt = getMean(allDCt[ctrlIdx]);
+
+            for(let i=0; i<nGrp; i++) {
+                let dCts = allDCt[i];
+                let rels = dCts.map(d => Math.pow(2, -(d - ctrlMeanDCt)));
+                allRelExpr.push(rels);
+                meanRelExpr.push(getMean(rels));
+                if(rels.length > maxRep) maxRep = rels.length;
+            }
+
+            // 3. 统计计算 (调用手写函数 manualTTest)
+            let statTable = "";
+            let anovaBadge = ""; // 简化，直接给两两比较
+            
+            if(nGrp >= 2) {
+                let mat = `<div class="table-responsive"><table class="table table-bordered matrix-table mb-0"><thead><tr><th>VS</th>`;
+                groupNames.forEach(n => mat += `<th>${n}</th>`);
+                mat += `</tr></thead><tbody>`;
+
+                for(let r=0; r<nGrp; r++) {
+                    mat += `<tr><th class="table-light">${groupNames[r]}</th>`;
+                    for(let c=0; c<nGrp; c++) {
+                        if(r === c) mat += `<td class="bg-light">-</td>`;
+                        else {
+                            // 这里调用手写的 T test
+                            let pVal = manualTTest(allDCt[r], allDCt[c]);
+                            mat += `<td>${fmtP(pVal)}</td>`;
+                        }
+                    }
+                    mat += `</tr>`;
+                }
+                mat += `</tbody></table></div>`;
+                statTable = mat;
+            }
+
+            // 4. Prism 数据
+            let prismTxt = groupNames.join("\t") + "\n";
+            for(let r=0; r<maxRep; r++) {
+                let row = [];
+                for(let i=0; i<nGrp; i++) row.push(allRelExpr[i][r] !== undefined ? allRelExpr[i][r].toFixed(4) : "");
+                prismTxt += row.join("\t") + "\n";
+            }
+
+            // 5. 渲染 HTML
+            let cardId = `chart_${g}`;
+            let txtId = `txt_${g}`;
+            
+            let html = `
+            <div class="gene-card">
+                <div class="gene-header">
+                    <span class="gene-title">🎯 ${geneNames[g]}</span>
+                </div>
+                <div class="row g-0">
+                    <div class="col-lg-5 p-4 border-end">
+                         <div style="height:300px"><canvas id="${cardId}"></canvas></div>
+                    </div>
+                    <div class="col-lg-7 p-4">
+                        <div class="mb-4">
+                            <div class="d-flex justify-content-between mb-2">
+                                <h6 class="fw-bold text-primary">📄 GraphPad Prism 数据</h6>
+                                <button class="btn btn-sm btn-outline-primary" onclick="copyText('${txtId}')">📋 一键复制</button>
+                            </div>
+                            <textarea id="${txtId}" class="form-control prism-area" readonly>${prismTxt}</textarea>
+                        </div>
+                        <div>
+                            <h6 class="fw-bold text-dark mb-2">🧮 两两比较矩阵 (P Value)</h6>
+                            ${statTable}
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+            container.insertAdjacentHTML('beforeend', html);
+
+            new Chart(document.getElementById(cardId), {
+                type: 'bar',
+                data: {
+                    labels: groupNames,
+                    datasets: [{ label: 'Relative Expression', data: meanRelExpr, backgroundColor: '#36a2eb', borderRadius: 4 }]
+                },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: {display:false} }, scales: { y: { beginAtZero: true } } }
+            });
+        }
+    }
+    
+    function copyText(id) {
+        document.getElementById(id).select();
+        document.execCommand("copy");
+    }
+</script>
+</body>
+</html>
